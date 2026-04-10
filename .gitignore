@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Environment & Secrets
+.env
+service-account.json
+
+# Auto-generated
+cookies.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

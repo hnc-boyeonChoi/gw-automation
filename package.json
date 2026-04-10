@@ -1,0 +1,20 @@
+{
+  "name": "gw-automation",
+  "version": "2.0.0",
+  "description": "한컴 그룹웨어 자동화 - Pub/Sub 기반",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js",
+    "test:pubsub": "node test-pubsub.js",
+    "test:publish": "node test-publish.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google-cloud/pubsub": "^5.3.0",
+    "dotenv": "^17.4.0",
+    "googleapis": "^171.4.0",
+    "playwright": "^1.59.1"
+  }
+}
