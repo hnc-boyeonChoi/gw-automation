@@ -15,6 +15,14 @@ const PUBSUB_CONFIG = {
 };
 
 // =====================
+// OpenAI 설정
+// =====================
+const OPENAI_CONFIG = {
+  MODEL: 'gpt-4o-mini',  // 빠르고 저렴한 모델
+  MAX_TOKENS: 150,
+};
+
+// =====================
 // Pub/Sub 발행
 // =====================
 function publishToPubSub(message) {
@@ -152,6 +160,484 @@ function decrypt(encrypted) {
   const encryptedBytes = Utilities.base64Decode(encrypted);
   const decrypted = encryptedBytes.map((b, i) => b ^ keyBytes[i % keyBytes.length]);
   return Utilities.newBlob(decrypted).getDataAsString();
+}
+
+// =====================
+// 대화 기록 관리
+// =====================
+const CONVERSATION_CONFIG = {
+  MAX_MESSAGES: 10,      // 최대 저장 메시지 수
+  MAX_AGE_HOURS: 24,     // 최대 보관 시간 (시간)
+};
+
+function getConversationHistory(userId) {
+  const props = getProps();
+  const historyJson = props.getProperty(`conv_${userId}`) || '[]';
+  try {
+    let history = JSON.parse(historyJson);
+
+    // 24시간 지난 메시지 필터링
+    const maxAge = CONVERSATION_CONFIG.MAX_AGE_HOURS * 60 * 60 * 1000;
+    const now = Date.now();
+    history = history.filter(msg => {
+      const msgTime = new Date(msg.timestamp).getTime();
+      return (now - msgTime) < maxAge;
+    });
+
+    return history;
+  } catch (e) {
+    console.error('대화 기록 파싱 실패:', e.message);
+    return [];
+  }
+}
+
+function addToConversationHistory(userId, role, content) {
+  let history = getConversationHistory(userId);
+
+  history.push({
+    role: role,
+    content: content,
+    timestamp: new Date().toISOString()
+  });
+
+  // 최대 개수 유지
+  if (history.length > CONVERSATION_CONFIG.MAX_MESSAGES) {
+    history = history.slice(-CONVERSATION_CONFIG.MAX_MESSAGES);
+  }
+
+  const props = getProps();
+  props.setProperty(`conv_${userId}`, JSON.stringify(history));
+  console.log(`대화 기록 추가: ${userId}, role=${role}, 총 ${history.length}개`);
+}
+
+function clearConversationHistory(userId) {
+  const props = getProps();
+  props.deleteProperty(`conv_${userId}`);
+  props.deleteProperty(`last_intent_${userId}`);
+  console.log(`대화 기록 초기화: ${userId}`);
+}
+
+// 마지막 스크래핑 intent 저장/조회
+function saveLastScrapingIntent(userId, intent) {
+  const props = getProps();
+  props.setProperty(`last_intent_${userId}`, intent);
+}
+
+function getLastScrapingIntent(userId) {
+  const props = getProps();
+  return props.getProperty(`last_intent_${userId}`);
+}
+
+// =====================
+// OpenAI API 호출
+// =====================
+function callOpenAI(systemPrompt, userMessage) {
+  const props = getProps();
+  const apiKey = props.getProperty('OPENAI_API_KEY');
+
+  if (!apiKey) {
+    console.error('OPENAI_API_KEY가 설정되지 않았습니다.');
+    return null;
+  }
+
+  const payload = {
+    model: OPENAI_CONFIG.MODEL,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userMessage }
+    ],
+    max_tokens: OPENAI_CONFIG.MAX_TOKENS,
+    temperature: 0.1,  // 일관된 응답을 위해 낮은 temperature
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  };
+
+  try {
+    const response = UrlFetchApp.fetch('https://api.openai.com/v1/chat/completions', options);
+    const result = JSON.parse(response.getContentText());
+
+    if (result.error) {
+      console.error('OpenAI API 에러:', result.error);
+      return null;
+    }
+
+    return result.choices[0].message.content.trim();
+  } catch (e) {
+    console.error('OpenAI 호출 실패:', e.message);
+    return null;
+  }
+}
+
+// 대화 히스토리 포함 OpenAI 호출
+function callOpenAIWithHistory(userId, systemPrompt, userMessage) {
+  const props = getProps();
+  const apiKey = props.getProperty('OPENAI_API_KEY');
+
+  if (!apiKey) {
+    console.error('OPENAI_API_KEY가 설정되지 않았습니다.');
+    return null;
+  }
+
+  // 대화 히스토리 가져오기
+  const history = getConversationHistory(userId);
+  console.log(`대화 히스토리: ${history.length}개 메시지`);
+
+  // 메시지 배열 구성: system + history + current
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history.map(h => ({ role: h.role, content: h.content })),
+    { role: 'user', content: userMessage }
+  ];
+
+  const payload = {
+    model: OPENAI_CONFIG.MODEL,
+    messages: messages,
+    max_tokens: OPENAI_CONFIG.MAX_TOKENS,
+    temperature: 0.1,
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: {
+      'Authorization': 'Bearer ' + apiKey,
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  };
+
+  try {
+    const response = UrlFetchApp.fetch('https://api.openai.com/v1/chat/completions', options);
+    const result = JSON.parse(response.getContentText());
+
+    if (result.error) {
+      console.error('OpenAI API 에러:', result.error);
+      return null;
+    }
+
+    return result.choices[0].message.content.trim();
+  } catch (e) {
+    console.error('OpenAI 호출 실패:', e.message);
+    return null;
+  }
+}
+
+// =====================
+// 빠른 패턴 매칭 (LLM 호출 전 - 비용 절감)
+// =====================
+const QUICK_PATTERNS = {
+  team: /팀\s*(현황|상황)?|근태|출근|누가\s*(출근|휴가|외근)|우리\s*팀/i,
+  leave: /연차|휴가|남은\s*(연차|휴가)|내\s*연차/i,
+  approval: /결재|승인|미결/i,
+  board: /게시판|공지|새\s*글/i,
+  mail: /메일|이메일/i,
+  note: /쪽지/i,
+  budget: /예산|예실|비용/i,
+  all: /전체\s*브리핑|모든\s*정보|오늘\s*현황|다\s*알려/i,
+  login: /로그인|접속/i,
+  greeting: /^(안녕|하이|헬로|ㅎㅇ|hi|hello)/i,
+  help: /도움말|뭐\s*할\s*수\s*있|어떤\s*기능/i,
+  clear: /잊어|초기화|리셋|대화\s*삭제/i,
+  repeat: /^(다시|아까\s*그거|또\s*보여)$/i,
+};
+
+function quickPatternMatch(message) {
+  const trimmed = message.trim();
+
+  for (const [intent, pattern] of Object.entries(QUICK_PATTERNS)) {
+    if (pattern.test(trimmed)) {
+      console.log(`빠른 패턴 매칭: "${trimmed}" → ${intent}`);
+      return { intent, confidence: 0.9, fromPattern: true };
+    }
+  }
+  return null;
+}
+
+// =====================
+// 의도 분류 (대화 맥락 포함)
+// =====================
+function classifyIntent(userId, userMessage) {
+  // 1. 빠른 패턴 매칭 시도 (LLM 호출 스킵)
+  const quickResult = quickPatternMatch(userMessage);
+  if (quickResult) {
+    return quickResult;
+  }
+
+  // 2. 패턴 매칭 실패 시 LLM 호출
+  const systemPrompt = `당신은 그룹웨어 챗봇의 의도 분류기입니다.
+사용자 메시지를 분석하여 아래 intent 중 하나를 JSON으로 반환하세요.
+
+**핵심 규칙:**
+1. 그룹웨어/업무와 관련 없는 일반 대화 → 반드시 unknown
+2. 메시지에 구체적인 업무 주제(팀, 연차, 결재, 게시판 등)가 있으면 → 해당 intent
+3. "다시 알려줘"가 있어도 업무 주제가 명확하면 → 해당 intent
+4. repeat은 오직 "다시", "아까 그거"처럼 주제가 전혀 없을 때만
+
+**unknown으로 분류해야 하는 경우:**
+- 날씨, 시간, 개인적인 이야기 ("비가 와", "배고파", "오늘 뭐해?")
+- 그룹웨어와 무관한 질문 ("맛집 추천해줘", "게임 뭐해?")
+- 업무 키워드가 전혀 없는 잡담
+
+**예시:**
+- "팀 현황 다시 알려줘" → team
+- "연차 다시 보여줘" → leave
+- "다시 보여줘" → repeat
+- "그리고 연차는?" → leave
+- "오늘 비가 오잖아" → unknown (업무 무관)
+- "점심 뭐 먹지?" → unknown (업무 무관)
+- "안녕" → greeting
+
+**가능한 intent:**
+- team: 팀 현황, 팀원 근태, 누가 출근/휴가/건강검진
+- leave: 내 연차, 남은 휴가, 연차 잔여
+- approval: 결재, 전자결재, 승인할 문서
+- board: 게시판, 공지사항, 새 글
+- note: 쪽지
+- mail: 메일, 이메일
+- budget: 예산, 예실, 비용
+- all: 전체 브리핑, 오늘 현황, 모든 정보
+- login: 로그인, 접속
+- greeting: 인사 (안녕, 하이)
+- help: 도움말, 뭐 할 수 있어
+- repeat: 주제 없이 "다시", "아까 그거"만 있을 때
+- clear: 대화 기록 초기화 (잊어, 초기화, 리셋)
+- unknown: 업무와 무관한 대화, 위에 해당하지 않는 경우
+
+반드시 JSON 형식으로만 응답하세요:
+{"intent": "unknown", "confidence": 0.95}`;
+
+  const response = callOpenAIWithHistory(userId, systemPrompt, userMessage);
+
+  if (!response) {
+    return { intent: 'unknown', confidence: 0 };
+  }
+
+  try {
+    // JSON 파싱 시도
+    const parsed = JSON.parse(response);
+    return parsed;
+  } catch (e) {
+    // JSON 파싱 실패 시 텍스트에서 intent 추출 시도
+    console.error('JSON 파싱 실패:', response);
+    return { intent: 'unknown', confidence: 0 };
+  }
+}
+
+// =====================
+// 자연어 메시지 처리 (대화 기록 포함)
+// =====================
+function handleNaturalLanguage(event, userMessage) {
+  const userId = event.chat?.user?.name || event.user?.name;
+  let spaceId = event.chat?.space?.name
+    || event.space?.name
+    || event.message?.space?.name
+    || event.chat?.messagePayload?.space?.name;
+
+  // spaceId가 없으면 저장된 값 사용
+  if (!spaceId && userId) {
+    const props = getProps();
+    spaceId = props.getProperty(`space_${userId}`);
+    console.log('저장된 spaceId 사용:', spaceId);
+  }
+
+  console.log('자연어 처리 시작:', userMessage);
+  console.log('userId:', userId, 'spaceId:', spaceId);
+
+  if (!userId || !spaceId) {
+    console.error('userId 또는 spaceId를 찾을 수 없음');
+    return reply('오류: 사용자 정보를 찾을 수 없어요. 다시 시도해주세요.');
+  }
+
+  // 사용자 메시지를 대화 기록에 저장
+  addToConversationHistory(userId, 'user', userMessage);
+
+  // 의도 분류 (대화 히스토리 포함)
+  const result = classifyIntent(userId, userMessage);
+  console.log('의도 분류 결과:', JSON.stringify(result));
+
+  const intent = result.intent;
+  const confidence = result.confidence || 0;
+
+  // confidence가 낮으면 친절한 응답 + 메뉴 카드
+  if (confidence < 0.7 && intent !== 'greeting' && intent !== 'help' && intent !== 'clear' && intent !== 'repeat') {
+    return createUnknownResponseWithMenu(userMessage);
+  }
+
+  let response;
+
+  switch (intent) {
+    case 'greeting':
+      response = '안녕하세요! 무엇을 도와드릴까요?\n\n' +
+        '팀 현황, 연차, 결재, 게시판, 메일 등을 확인할 수 있어요.\n' +
+        '예: "팀 현황 알려줘", "내 연차 얼마나 남았어?"';
+      addToConversationHistory(userId, 'assistant', response);
+      return reply(response);
+
+    case 'help':
+      response = '제가 할 수 있는 것들이에요:\n\n' +
+        '👥 팀 현황 - "팀 현황 알려줘"\n' +
+        '🏖️ 연차 - "내 연차 얼마나 남았어?"\n' +
+        '📝 결재 - "결재할 문서 있어?"\n' +
+        '📌 게시판 - "새 공지사항 있어?"\n' +
+        '✉️ 쪽지 - "안 읽은 쪽지 있어?"\n' +
+        '📧 메일 - "메일 확인해줘"\n' +
+        '💰 예실 - "예산 현황 알려줘"\n' +
+        '📊 전체 - "오늘 브리핑 해줘"';
+      addToConversationHistory(userId, 'assistant', response);
+      return reply(response);
+
+    case 'clear':
+      clearConversationHistory(userId);
+      response = '대화 기록을 초기화했어요. 새로 시작할게요!';
+      return reply(response);
+
+    case 'repeat':
+      // 마지막 스크래핑 요청 반복
+      const lastIntent = getLastScrapingIntent(userId);
+      if (lastIntent) {
+        return triggerScrapeByIntent(userId, spaceId, lastIntent);
+      } else {
+        response = '이전에 요청한 내용이 없어요. 무엇을 알려드릴까요?';
+        return reply(response);
+      }
+
+    case 'team':
+    case 'leave':
+    case 'approval':
+    case 'board':
+    case 'note':
+    case 'mail':
+    case 'budget':
+    case 'all':
+      // 마지막 스크래핑 intent 저장
+      saveLastScrapingIntent(userId, intent);
+      // 스크래핑 요청
+      return triggerScrapeByIntent(userId, spaceId, intent);
+
+    case 'login':
+      return triggerLoginByIntent(userId, spaceId);
+
+    case 'unknown':
+    default:
+      // 친절한 안내 메시지 + 메뉴 카드
+      return createUnknownResponseWithMenu(userMessage);
+  }
+}
+
+// unknown일 때 친절한 응답 + 메뉴 카드
+function createUnknownResponseWithMenu(userMessage) {
+  return {
+    hostAppDataAction: {
+      chatDataAction: {
+        createMessageAction: {
+          message: {
+            text: '그건 제가 도와드리기 어려워요 😅\n그룹웨어 관련 정보를 확인해보세요!',
+            cardsV2: [{
+              cardId: "menuCardUnknown",
+              card: {
+                header: {
+                  title: "GW Automation",
+                  subtitle: "그룹웨어 정보 조회"
+                },
+                sections: [{
+                  widgets: [{
+                    buttonList: {
+                      buttons: [
+                        { text: "👥 팀 현황", onClick: { action: { function: "triggerScrape", parameters: [{ key: "scrapeType", value: "team" }] } } },
+                        { text: "🏖️ 연차", onClick: { action: { function: "triggerScrape", parameters: [{ key: "scrapeType", value: "leave" }] } } },
+                        { text: "📝 결재", onClick: { action: { function: "triggerScrape", parameters: [{ key: "scrapeType", value: "approval" }] } } }
+                      ]
+                    }
+                  }, {
+                    buttonList: {
+                      buttons: [
+                        { text: "📌 게시판", onClick: { action: { function: "triggerScrape", parameters: [{ key: "scrapeType", value: "board" }] } } },
+                        { text: "📧 메일", onClick: { action: { function: "triggerScrape", parameters: [{ key: "scrapeType", value: "mail" }] } } },
+                        { text: "📊 전체 브리핑", onClick: { action: { function: "triggerScrape", parameters: [{ key: "scrapeType", value: "all" }] } } }
+                      ]
+                    }
+                  }]
+                }]
+              }
+            }]
+          }
+        }
+      }
+    }
+  };
+}
+
+function triggerScrapeByIntent(userId, spaceId, scrapeType) {
+  const props = getProps();
+  const encId = props.getProperty(`cred_id_${userId}`);
+
+  if (!encId) {
+    return reply('먼저 로그인 정보를 등록해주세요!');
+  }
+
+  const username = decrypt(encId);
+
+  const typeMessages = {
+    team: '👥 팀 현황',
+    approval: '📝 전자결재',
+    leave: '🏖️ 연차 현황',
+    board: '📌 게시판',
+    note: '✉️ 쪽지',
+    mail: '📧 메일',
+    budget: '💰 예실현황',
+    all: '📊 전체 브리핑'
+  };
+  const typeLabel = typeMessages[scrapeType] || scrapeType;
+
+  try {
+    publishToPubSub({
+      action: 'scrape',
+      username: username,
+      userId: userId,
+      spaceId: spaceId,
+      scrapeType: scrapeType,
+      timestamp: new Date().toISOString(),
+    });
+
+    console.log('자연어 → Pub/Sub 발행 완료:', scrapeType);
+    return reply(`🔄 ${typeLabel} 조회 중이에요...`);
+  } catch (e) {
+    console.error('triggerScrapeByIntent 에러:', e.message);
+    return reply('오류가 발생했어요: ' + e.message);
+  }
+}
+
+function triggerLoginByIntent(userId, spaceId) {
+  const props = getProps();
+  const encId = props.getProperty(`cred_id_${userId}`);
+
+  if (!encId) {
+    return reply('먼저 로그인 정보를 등록해주세요!');
+  }
+
+  const username = decrypt(encId);
+
+  try {
+    publishToPubSub({
+      action: 'login',
+      username: username,
+      userId: userId,
+      spaceId: spaceId,
+      timestamp: new Date().toISOString(),
+    });
+
+    return reply('🔄 로그인 진행 중이에요!\n📱 Okta Verify 앱에서 푸시 승인해주세요.');
+  } catch (e) {
+    return reply('오류가 발생했어요: ' + e.message);
+  }
 }
 
 // =====================
@@ -365,6 +851,14 @@ function onMessage(event) {
   const props = getProps();
   const state = props.getProperty(`state_${userId}`) || 'NONE';
 
+  // 사용자 메시지 텍스트 추출
+  const userMessage = event.chat?.messagePayload?.message?.text
+    || event.message?.text
+    || event.message?.argumentText
+    || '';
+
+  console.log('사용자 메시지:', userMessage);
+
   if (state !== 'DONE') {
     return {
       hostAppDataAction: {
@@ -402,6 +896,15 @@ function onMessage(event) {
     };
   }
 
+  // 자연어 처리 시도
+  if (userMessage && userMessage.trim().length > 0) {
+    const nlResult = handleNaturalLanguage(event, userMessage.trim());
+    if (nlResult) {
+      return nlResult;  // 자연어로 처리 성공
+    }
+  }
+
+  // 메뉴 카드 표시 (기본)
   return {
     hostAppDataAction: {
       chatDataAction: {

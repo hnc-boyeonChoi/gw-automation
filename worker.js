@@ -4,6 +4,7 @@ const { chromium } = require('playwright');
 const { google } = require('googleapis');
 const path = require('path');
 const fs = require('fs');
+const { GwApiClient } = require('./api-client');
 
 // ========== 설정 ==========
 const CONFIG = {
@@ -44,6 +45,7 @@ const ATN_STATUS = {
   leave: ['휴가', '연차', '월차', '경조휴가', '병가', '출산휴가', '육아휴직'],
   outside: ['외근', '출장', '외출'],
   halfDay: ['반차', '오전반차', '오후반차'],
+  health: ['건강검진'],
   absent: ['결근', '미출근'],
 };
 
@@ -205,6 +207,31 @@ async function doLogin(task, options = {}) {
     fs.writeFileSync(CONFIG.COOKIE_PATH, JSON.stringify(cookies, null, 2));
     log('Login', `쿠키 저장 완료: ${cookies.length}개`);
 
+    // 10. userInfo 저장 (v3.0 API용)
+    try {
+      const userInfo = await page.evaluate(() => {
+        if (typeof loginUserInfo !== 'undefined') {
+          return {
+            empId: loginUserInfo.empId,
+            cmpId: loginUserInfo.cmpId,
+            userId: loginUserInfo.userId,
+            userName: loginUserInfo.userName,
+            deptId: loginUserInfo.deptId,
+            deptCd: loginUserInfo.deptCd,
+            deptName: loginUserInfo.deptName,
+          };
+        }
+        return null;
+      });
+      if (userInfo) {
+        const userInfoPath = path.join(__dirname, 'userinfo.json');
+        fs.writeFileSync(userInfoPath, JSON.stringify(userInfo, null, 2));
+        log('Login', `userInfo 저장 완료: ${userInfo.userName}`);
+      }
+    } catch (e) {
+      log('Login', `userInfo 저장 실패: ${e.message}`);
+    }
+
     await sendChatMessage(spaceId, '✅ 로그인 완료!');
 
     // returnBrowser 옵션이 true이면 브라우저를 닫지 않고 반환
@@ -308,7 +335,7 @@ async function scrapeTeamAttendance(page, userInfo) {
   const empList = json.data?.empList || json.empList || json.list || [];
   log('Scrape', `[팀 현황] 팀원 수: ${empList.length}`);
 
-  const attendance = { working: [], offWork: [], leave: [], outside: [], halfDay: [] };
+  const attendance = { working: [], offWork: [], leave: [], outside: [], halfDay: [], health: [] };
 
   // 상태 분류 헬퍼
   function categorizeStatus(atnStatus) {
@@ -986,9 +1013,22 @@ async function doScrape(task, existingSession = null) {
     if (team) {
       if (scrapeType !== 'all') lines.push(`👥 *팀 현황* (${timestamp})`);
       else lines.push(`👥 *팀 현황* (${team.totalMembers}명)`);
-      lines.push(`   휴가: ${team.attendance.leave.length}명, 외근: ${team.attendance.outside.length}명, 반차: ${team.attendance.halfDay.length}명`);
+
+      // 요약 라인 (0명인 항목은 제외)
+      const summary = [];
+      if (team.attendance.leave.length > 0) summary.push(`휴가: ${team.attendance.leave.length}명`);
+      if (team.attendance.outside.length > 0) summary.push(`외근: ${team.attendance.outside.length}명`);
+      if (team.attendance.halfDay.length > 0) summary.push(`반차: ${team.attendance.halfDay.length}명`);
+      if (team.attendance.health?.length > 0) summary.push(`건강검진: ${team.attendance.health.length}명`);
+      if (summary.length > 0) {
+        lines.push(`   ${summary.join(', ')}`);
+      }
+
       if (team.attendance.leave.length > 0) {
         lines.push(`   🏖️ ${team.attendance.leave.map(m => m.name).join(', ')}`);
+      }
+      if (team.attendance.health?.length > 0) {
+        lines.push(`   🏥 ${team.attendance.health.map(m => m.name).join(', ')}`);
       }
       if (team.attendance.working && team.attendance.working.length > 0) {
         lines.push(`   ✅ 출근: ${team.attendance.working.map(m => m.name).join(', ')}`);
@@ -1077,10 +1117,169 @@ async function doScrape(task, existingSession = null) {
   }
 }
 
+// ========== v3.0: API 직접 호출 스크래핑 ==========
+// API로 가능한 것: team, approval, note, mail
+// Playwright 필요한 것: leave, board, budget (페이지 시퀀스 필요)
+const API_SUPPORTED = ['team', 'approval', 'note', 'mail'];
+
+async function doScrapeV3(task) {
+  const { spaceId, scrapeType = 'all' } = task;
+  log('ScrapeV3', `시작 (${scrapeType})`);
+
+  // Playwright가 필요한 타입은 v2 방식으로 처리
+  if (['leave', 'board', 'budget', 'all'].includes(scrapeType)) {
+    log('ScrapeV3', `${scrapeType}은 Playwright 필요, v2 방식으로 전환`);
+    return { success: false, error: 'needs_playwright', usePlaywright: true };
+  }
+
+  try {
+    // 쿠키 파일 확인
+    if (!fs.existsSync(CONFIG.COOKIE_PATH)) {
+      return { success: false, error: 'No cookies', needLogin: true };
+    }
+
+    // API 클라이언트 초기화
+    const client = new GwApiClient();
+    await client.init();
+    log('ScrapeV3', `사용자: ${client.userInfo.userName}`);
+
+    let result = {};
+
+    // API로 가능한 것만 처리 (team, approval, note, mail)
+    switch (scrapeType) {
+      case 'team':
+        result.team = await client.getTeamAttendance();
+        break;
+      case 'approval':
+        result.approval = await client.getApproval();
+        break;
+      case 'note':
+        result.note = await client.getNote();
+        break;
+      case 'mail':
+        result.mail = await client.getMail();
+        break;
+    }
+
+    // 메시지 포맷팅
+    const lines = [];
+    const timestamp = new Date().toLocaleString('ko-KR');
+    const { team, leave, approval, board, note, mail, budget } = result;
+
+    if (scrapeType === 'all') {
+      lines.push(`📊 *그룹웨어 현황* (${timestamp})`);
+      lines.push('');
+    }
+
+    if (team) {
+      if (scrapeType !== 'all') lines.push(`👥 *팀 현황* (${timestamp})`);
+      else lines.push(`👥 *팀 현황* (${team.totalMembers}명)`);
+
+      const summary = [];
+      if (team.attendance.leave.length > 0) summary.push(`휴가: ${team.attendance.leave.length}명`);
+      if (team.attendance.outside.length > 0) summary.push(`외근: ${team.attendance.outside.length}명`);
+      if (team.attendance.halfDay.length > 0) summary.push(`반차: ${team.attendance.halfDay.length}명`);
+      if (team.attendance.health?.length > 0) summary.push(`건강검진: ${team.attendance.health.length}명`);
+      if (summary.length > 0) lines.push(`   ${summary.join(', ')}`);
+
+      if (team.attendance.leave.length > 0) {
+        lines.push(`   🏖️ ${team.attendance.leave.map(m => m.name).join(', ')}`);
+      }
+      if (team.attendance.health?.length > 0) {
+        lines.push(`   🏥 ${team.attendance.health.map(m => m.name).join(', ')}`);
+      }
+      if (team.attendance.working?.length > 0) {
+        lines.push(`   ✅ 출근: ${team.attendance.working.map(m => m.name).join(', ')}`);
+      }
+      if (team.attendance.offWork?.length > 0) {
+        lines.push(`   🚪 퇴근: ${team.attendance.offWork.map(m => m.name).join(', ')}`);
+      }
+      if (scrapeType === 'all') lines.push('');
+    }
+
+    if (leave) {
+      if (scrapeType !== 'all') lines.push(`🏖️ *내 연차* (${timestamp})`);
+      lines.push(`🏖️ 연차 ${leave.remaining}일 남음 (${leave.used}/${leave.total}일 사용)`);
+      const otherLeaves = [];
+      if (leave.prizeRemaining > 0) otherLeaves.push(`포상 ${leave.prizeRemaining}일`);
+      if (leave.rewardRemaining > 0) otherLeaves.push(`보상 ${leave.rewardRemaining}일`);
+      if (leave.specialRemaining > 0) otherLeaves.push(`특별 ${leave.specialRemaining}일`);
+      if (otherLeaves.length > 0) lines.push(`   + ${otherLeaves.join(', ')}`);
+      if (scrapeType === 'all') lines.push('');
+    }
+
+    if (approval) {
+      if (scrapeType !== 'all') lines.push(`📝 *전자결재* (${timestamp})`);
+      lines.push(`📝 ${approval.pending}건 대기`);
+    }
+
+    if (board) {
+      if (scrapeType !== 'all') lines.push(`📌 *새 게시글* (${timestamp})`);
+      if (board.recentPosts?.length > 0) {
+        lines.push(`📌 새 게시글 ${board.recentPosts.length}건`);
+        board.recentPosts.slice(0, 5).forEach(post => {
+          if (post.link) {
+            lines.push(`   • <${post.link}|${post.title}>`);
+          } else {
+            lines.push(`   • ${post.title}`);
+          }
+        });
+        if (board.recentPosts.length > 5) {
+          lines.push(`   ... 외 ${board.recentPosts.length - 5}건`);
+        }
+      } else {
+        lines.push(`📌 새 게시글 없음`);
+      }
+    }
+
+    if (note) {
+      if (scrapeType !== 'all') lines.push(`✉️ *쪽지* (${timestamp})`);
+      lines.push(`✉️ ${note.unreadCount}건 안 읽음`);
+    }
+
+    if (mail) {
+      if (scrapeType !== 'all') lines.push(`📧 *메일* (${timestamp})`);
+      lines.push(`📧 ${mail.unreadCount}건 안 읽음`);
+    }
+
+    if (budget) {
+      if (scrapeType !== 'all') lines.push(`💰 *예실현황* (${timestamp})`);
+      lines.push(`💰 ${budget.period}`);
+      lines.push(`   총 예산: ${budget.budget}원 / 사용: ${budget.spent}원 / 잔액: ${budget.remaining}원`);
+      if (budget.items?.length > 0) {
+        lines.push(`   ─────────`);
+        budget.items.forEach(item => {
+          const budgetVal = parseInt(item.budget.replace(/,/g, '')) || 1;
+          const spentVal = parseInt(item.spent.replace(/,/g, '')) || 0;
+          const usedPct = Math.round((spentVal / budgetVal) * 100) || 0;
+          lines.push(`   • ${item.account}: ${item.budget}원 (사용 ${usedPct}%)`);
+        });
+      }
+    }
+
+    const resultMessage = lines.join('\n');
+    log('ScrapeV3', '결과:\n' + resultMessage);
+    await sendChatMessage(spaceId, resultMessage);
+    log('ScrapeV3', '완료');
+    return { success: true };
+
+  } catch (err) {
+    log('ScrapeV3', '에러:', err.message);
+
+    // 세션 만료 판단
+    if (err.message.includes('세션 만료') || err.message.includes('다시 로그인')) {
+      return { success: false, error: err.message, needLogin: true };
+    }
+
+    return { success: false, error: err.message };
+  }
+}
+
 // ========== 메시지 핸들러 ==========
 async function handleMessage(message) {
   const data = JSON.parse(message.data.toString());
   log('Worker', '메시지 수신:', data.action);
+  log('Worker', '메시지 데이터:', JSON.stringify(data));
 
   switch (data.action) {
     case 'login':
@@ -1088,27 +1287,44 @@ async function handleMessage(message) {
       break;
 
     case 'scrape':
-      // 쿠키로 스크래핑 시도 (로그인 없이)
-      log('Worker', '쿠키 기반 스크래핑 시도');
-      const scrapeResult = await doScrape(data, null);
-      // 실패 시 자동 재로그인
-      if (!scrapeResult.success && scrapeResult.error?.includes('만료')) {
+      // v3.0: API 직접 호출 방식 (브라우저 없이)
+      log('Worker', 'v3.0 API 스크래핑 시도');
+      const scrapeResultV3 = await doScrapeV3(data);
+
+      // Playwright 필요한 경우 (leave, board, budget)
+      if (scrapeResultV3.usePlaywright) {
+        log('Worker', 'Playwright 방식으로 전환');
+        const playwrightResult = await doScrape(data, null);
+        if (!playwrightResult.success && playwrightResult.error?.includes('만료')) {
+          log('Worker', '세션 만료, 재로그인 시도');
+          const loginResult = await doLogin(data, { returnBrowser: true });
+          if (loginResult.success) {
+            await doScrape(data, loginResult);
+            await loginResult.browser.close();
+          }
+        }
+        break;
+      }
+
+      // 로그인 필요 시 재로그인 후 재시도
+      if (!scrapeResultV3.success && scrapeResultV3.needLogin) {
         log('Worker', '세션 만료, 재로그인 시도');
-        const loginResult = await doLogin(data, { returnBrowser: true });
+        await sendChatMessage(data.spaceId, '🔄 세션 만료됨. 재로그인 중...');
+        const loginResult = await doLogin(data, { returnBrowser: false });
         if (loginResult.success) {
-          await doScrape(data, loginResult);
-          await loginResult.browser.close();
-          log('Worker', '브라우저 종료');
+          // 재로그인 후 v3 API로 다시 시도
+          log('Worker', '재로그인 성공, v3 API 재시도');
+          await doScrapeV3(data);
         }
       }
       break;
 
     case 'morning_briefing':
-      // 항상 로그인 + 스크래핑 (아침 브리핑용)
-      log('Worker', '로그인 + 스크래핑 시작');
+      // 항상 로그인 + 전체 스크래핑 (Playwright 사용)
+      log('Worker', '로그인 후 Playwright 전체 스크래핑');
       const mbLoginResult = await doLogin(data, { returnBrowser: true });
       if (mbLoginResult.success) {
-        await doScrape(data, mbLoginResult);
+        await doScrape({ ...data, scrapeType: 'all' }, mbLoginResult);
         await mbLoginResult.browser.close();
         log('Worker', '브라우저 종료');
       }
