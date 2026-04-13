@@ -1214,19 +1214,12 @@ async function doScrape(task, existingSession = null) {
 }
 
 // ========== v3.0: API 직접 호출 스크래핑 ==========
-// API로 가능한 것: team, approval, note, mail
-// Playwright 필요한 것: leave, board, budget (페이지 시퀀스 필요)
-const API_SUPPORTED = ['team', 'approval', 'note', 'mail'];
+// 모든 스크래핑이 API로 가능! Playwright 불필요!
+const API_SUPPORTED = ['all', 'team', 'approval', 'note', 'mail', 'budget', 'leave', 'board'];
 
 async function doScrapeV3(task) {
   const { spaceId, scrapeType = 'all' } = task;
   log('ScrapeV3', `시작 (${scrapeType})`);
-
-  // Playwright가 필요한 타입은 v2 방식으로 처리
-  if (['leave', 'board', 'budget', 'all'].includes(scrapeType)) {
-    log('ScrapeV3', `${scrapeType}은 Playwright 필요, v2 방식으로 전환`);
-    return { success: false, error: 'needs_playwright', usePlaywright: true };
-  }
 
   try {
     // 쿠키 파일 확인
@@ -1241,10 +1234,27 @@ async function doScrapeV3(task) {
 
     let result = {};
 
-    // API로 가능한 것만 처리 (team, approval, note, mail)
+    // 모든 타입을 API로 처리
     switch (scrapeType) {
+      case 'all':
+        // 모든 API 병렬 호출
+        log('ScrapeV3', '전체 브리핑 - 모든 API 병렬 호출');
+        const [team, leave, approval, board, note, mail, budget] = await Promise.all([
+          client.getTeamAttendance().catch(e => { log('ScrapeV3', `팀: ${e.message}`); return null; }),
+          client.getLeaveBalance().catch(e => { log('ScrapeV3', `연차: ${e.message}`); return null; }),
+          client.getApproval().catch(e => { log('ScrapeV3', `결재: ${e.message}`); return null; }),
+          client.getBoard().catch(e => { log('ScrapeV3', `게시판: ${e.message}`); return null; }),
+          client.getNote().catch(e => { log('ScrapeV3', `쪽지: ${e.message}`); return null; }),
+          client.getMail().catch(e => { log('ScrapeV3', `메일: ${e.message}`); return null; }),
+          client.getBudget().catch(e => { log('ScrapeV3', `예실: ${e.message}`); return null; }),
+        ]);
+        result = { team, leave, approval, board, note, mail, budget };
+        break;
       case 'team':
         result.team = await client.getTeamAttendance();
+        break;
+      case 'leave':
+        result.leave = await client.getLeaveBalance();
         break;
       case 'approval':
         result.approval = await client.getApproval();
@@ -1254,6 +1264,12 @@ async function doScrapeV3(task) {
         break;
       case 'mail':
         result.mail = await client.getMail();
+        break;
+      case 'budget':
+        result.budget = await client.getBudget();
+        break;
+      case 'board':
+        result.board = await client.getBoard();
         break;
     }
 

@@ -46,7 +46,13 @@ function loadCookies() {
     throw new Error('쿠키 파일이 없습니다. 먼저 로그인해주세요.');
   }
   const cookies = JSON.parse(fs.readFileSync(CONFIG.COOKIE_PATH, 'utf-8'));
-  return cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+  // 필수 쿠키만 필터링 (브라우저처럼)
+  const essentialCookies = ['JSESSIONID', 'SCOUTER', 'locale', 'AWSALB', 'AWSALBCORS', 'AWSALBTG', 'AWSALBTGCORS'];
+  const filtered = cookies.filter(c => essentialCookies.some(name => c.name.startsWith(name)));
+
+  log('Init', `쿠키 필터링: ${cookies.length}개 → ${filtered.length}개`);
+  return filtered.map(c => `${c.name}=${c.value}`).join('; ');
 }
 
 // ========== API 클라이언트 ==========
@@ -79,10 +85,15 @@ class GwApiClient {
   }
 
   async validateSession() {
-    // 간단한 API 호출로 세션 유효성 검증
+    // 간단한 API 호출로 세션 유효성 검증 (최소 헤더만)
     const response = await fetch(`${CONFIG.BASE_URL}${CONFIG.API.MAIL}`, {
       method: 'POST',
-      headers: this.getHeaders(),
+      headers: {
+        'Cookie': this.cookieString,
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Naonajax': 'xml',
+      },
     });
 
     if (!response.ok) {
@@ -98,14 +109,16 @@ class GwApiClient {
     log('Init', '세션 유효함');
   }
 
-  getHeaders(contentType = 'application/x-www-form-urlencoded') {
+  getHeaders(contentType = 'application/x-www-form-urlencoded', referer = null) {
     return {
       'Cookie': this.cookieString,
       'Content-Type': `${contentType}; charset=UTF-8`,
       'X-Requested-With': 'XMLHttpRequest',
       'Naonajax': 'json',
-      'Accept': 'application/json, text/plain, */*',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': '*/*',
+      'Origin': CONFIG.BASE_URL,
+      'Referer': referer || `${CONFIG.BASE_URL}/ekp/scr/main/homGwMain`,
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
     };
   }
 
@@ -114,7 +127,7 @@ class GwApiClient {
     const response = await fetch(url, {
       ...options,
       headers: {
-        ...this.getHeaders(options.contentType),
+        ...this.getHeaders(options.contentType, options.referer),
         ...options.headers,
       },
     });
@@ -310,67 +323,111 @@ class GwApiClient {
 
   // ========== 연차 ==========
   async getLeaveBalance() {
-    log('Leave', 'API 호출 시작');
+    log('Leave', 'API 호출 시작 (4단계 방식)');
 
-    const year = new Date().getFullYear();
+    const now = new Date();
+    const year = now.getFullYear().toString();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
 
-    // 방법 1: selectMyHolidayYearList API
     try {
-      const params = new URLSearchParams({
-        yyyy: year.toString(),
-        empId: this.userInfo.empId,
+      // 1단계: 메인 페이지 방문 (서버 세션 상태 설정)
+      const mainPageResponse = await fetch(`${CONFIG.BASE_URL}/ekp/scr/attend/atnAttendMain`, {
+        method: 'GET',
+        headers: {
+          'Cookie': this.cookieString,
+          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        },
       });
+      if (!mainPageResponse.ok) {
+        log('Leave', `1단계(메인페이지) 실패: ${mainPageResponse.status}`);
+      } else {
+        log('Leave', '1단계: atnAttendMain 페이지 방문 완료');
+      }
 
-      const result = await this.fetchApi(CONFIG.API.LEAVE_BALANCE, {
+      // 2단계: 사이드바 초기화 (세션 상태 설정)
+      const sidebarResponse = await fetch(`${CONFIG.BASE_URL}/ekp/inc/attend/atnAttendSideBar`, {
+        method: 'POST',
+        headers: {
+          'Cookie': this.cookieString,
+          'X-Requested-With': 'XMLHttpRequest',
+          'Naonajax': 'html',
+          'Referer': `${CONFIG.BASE_URL}/ekp/scr/attend/atnAttendMain`,
+        },
+      });
+      if (!sidebarResponse.ok) {
+        log('Leave', `2단계 실패: ${sidebarResponse.status}`);
+      } else {
+        log('Leave', '2단계: atnAttendSideBar 초기화 완료');
+      }
+
+      // 3단계: loginUserInfo (사용자 인증)
+      await this.fetchApi('/ekp/service/attend/loginUserInfo', {
+        method: 'POST',
+        body: '',
+        referer: `${CONFIG.BASE_URL}/ekp/scr/attend/atnAttendMain`,
+      });
+      log('Leave', '3단계: loginUserInfo 완료');
+
+      // 4단계: selectMyYearHoliday (연차 조회)
+      // 브라우저 캡처: __REQ_JSON_OBJECT__=URL인코딩JSON 형식
+      const requestBody = {
+        selectedYear: year,
+        selectedMonth: month,
+        cmpId: this.userInfo.cmpId,
+        empId: this.userInfo.empId,
+      };
+      log('Leave', `요청 파라미터: ${JSON.stringify(requestBody)}`);
+
+      // URLSearchParams로 올바른 form-encoding 사용
+      const params = new URLSearchParams();
+      params.append('__REQ_JSON_OBJECT__', JSON.stringify(requestBody));
+
+      const result = await this.fetchApi('/ekp/service/attend/selectMyYearHoliday', {
         method: 'POST',
         body: params.toString(),
+        referer: `${CONFIG.BASE_URL}/ekp/scr/attend/atnAttendMain`,
       });
 
-      log('Leave', '응답:', JSON.stringify(result).substring(0, 500));
+      log('Leave', '4단계 응답:', JSON.stringify(result).substring(0, 500));
 
-      if (result.data || result.list) {
-        const data = result.data || result;
+      // 응답 파싱 - data 객체에서 직접 추출
+      if (result.data) {
+        const d = result.data;
+
+        // 연차: totYhldCnt(발생), useYhldCnt(사용), remdYhldCnt(잔여)
+        const total = parseFloat(d.totYhldCnt || 0);
+        const used = parseFloat(d.useYhldCnt || 0);
+        const remaining = parseFloat(d.remdYhldCnt || (total - used));
+
+        // 특별휴가/보상휴가/포상휴가
+        const specialRemaining = parseFloat(d.remdSpclCnt || 0);
+        const rewardRemaining = parseFloat(d.remdRewdCnt || 0);
+        const prizeRemaining = parseFloat(d.remdPrizCnt || 0);
+
+        // 포상휴가 정보
+        const prizeTotal = parseFloat(d.prizHldCnt || 0);
+        const prizeUsed = parseFloat(d.usePrizCnt || (prizeTotal - prizeRemaining));
+
+        log('Leave', `결과: 연차 총=${total}, 사용=${used}, 잔여=${remaining}`);
+        log('Leave', `포상휴가: 총=${prizeTotal}, 사용=${prizeUsed}, 잔여=${prizeRemaining}`);
+        log('Leave', `특별=${specialRemaining}, 보상=${rewardRemaining}`);
+
         return {
-          total: parseFloat(data.totalCnt || data.totCnt || 0),
-          used: parseFloat(data.useCnt || data.usedCnt || 0),
-          remaining: parseFloat(data.remainCnt || data.restCnt || 0),
-          specialRemaining: parseFloat(data.specialRestCnt || 0),
-          rewardRemaining: parseFloat(data.rewardRestCnt || 0),
-          prizeRemaining: parseFloat(data.prizeRestCnt || 0),
+          total,
+          used,
+          remaining,
+          specialRemaining,
+          rewardRemaining,
+          prizeRemaining,
+          prizeTotal,
+          prizeUsed,
         };
       }
     } catch (e) {
-      log('Leave', '방법1 실패:', e.message);
+      log('Leave', '에러:', e.message);
     }
 
-    // 방법 2: selectMyYearHolidayCnt API
-    try {
-      const params2 = new URLSearchParams({
-        yyyy: year.toString(),
-      });
-
-      const result2 = await this.fetchApi(CONFIG.API.LEAVE_DETAIL, {
-        method: 'POST',
-        body: params2.toString(),
-      });
-
-      log('Leave', '방법2 응답:', JSON.stringify(result2).substring(0, 500));
-
-      if (result2.data) {
-        return {
-          total: parseFloat(result2.data.totalCnt || 0),
-          used: parseFloat(result2.data.useCnt || 0),
-          remaining: parseFloat(result2.data.remainCnt || 0),
-          specialRemaining: 0,
-          rewardRemaining: 0,
-          prizeRemaining: 0,
-        };
-      }
-    } catch (e) {
-      log('Leave', '방법2 실패:', e.message);
-    }
-
-    return { total: 0, used: 0, remaining: 0, specialRemaining: 0, rewardRemaining: 0, prizeRemaining: 0 };
+    return { total: 0, used: 0, remaining: 0, specialRemaining: 0, rewardRemaining: 0, prizeRemaining: 0, prizeTotal: 0, prizeUsed: 0 };
   }
 
   // ========== 결재 ==========
@@ -421,7 +478,7 @@ class GwApiClient {
 
   // ========== 게시판 ==========
   async getBoard() {
-    log('Board', 'API 호출 시작');
+    log('Board', 'API 호출 시작 (3단계 방식)');
 
     const today = new Date();
     const yesterday = new Date(today);
@@ -437,22 +494,46 @@ class GwApiClient {
     const todayStr = formatDate(today);
     const yesterdayStr = formatDate(yesterday);
 
-    // 방법 1: selectArticleList API
     try {
-      const params = new URLSearchParams({
-        boardId: 'BBN', // 공지사항
-        pageNo: '1',
-        listCnt: '20',
+      // 1단계: 게시판 메인 페이지 방문 (세션 초기화)
+      const boardMainUrl = `${CONFIG.BASE_URL}/ekp/scr/board/boardMain?at=TU5VMjc3NjAyMDAwMTk5NzgxOTI1Nzk%3D`;
+      const mainPageResponse = await fetch(boardMainUrl, {
+        method: 'GET',
+        headers: {
+          'Cookie': this.cookieString,
+          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        },
       });
+      if (!mainPageResponse.ok) {
+        log('Board', `1단계(메인페이지) 실패: ${mainPageResponse.status}`);
+      } else {
+        log('Board', '1단계: boardMain 페이지 방문 완료');
+      }
+
+      // 2단계: selectArticleList API
+      // 브라우저 캡처: {"param":{"brdId":"BBA","counting":"Y"}}
+      const requestBody = {
+        param: {
+          brdId: 'BBA',  // 공지사항
+          counting: 'Y',
+        }
+      };
+      log('Board', `요청 파라미터: ${JSON.stringify(requestBody)}`);
+
+      // URLSearchParams로 올바른 form-encoding 사용
+      const params = new URLSearchParams();
+      params.append('__REQ_JSON_OBJECT__', JSON.stringify(requestBody));
 
       const result = await this.fetchApi(CONFIG.API.BOARD_LIST, {
         method: 'POST',
         body: params.toString(),
+        referer: boardMainUrl,
       });
 
       log('Board', '응답:', JSON.stringify(result).substring(0, 500));
 
-      const articles = result.data?.list || result.list || [];
+      // atclList에서 게시글 추출
+      const articles = result.data?.atclList || result.data?.list || [];
       const recentPosts = articles
         .filter(a => {
           const date = a.regDt || a.createDate || '';
@@ -460,19 +541,20 @@ class GwApiClient {
         })
         .slice(0, 10)
         .map(a => ({
-          title: (a.atclTitle || a.title || '').substring(0, 40),
+          title: (a.subject || a.atclTitle || a.title || '').substring(0, 40),
           date: (a.regDt || a.createDate || '').substring(0, 10),
           link: a.atclId ? `https://gw.hancom.com/ekp/view/board/article/brdAtclViewPopup?atclId=${a.atclId}` : '',
         }));
 
+      log('Board', `결과: 최근 게시글 ${recentPosts.length}건`);
       return { unreadCount: recentPosts.length, recentPosts };
     } catch (e) {
-      log('Board', '방법1 실패:', e.message);
+      log('Board', '에러:', e.message);
     }
 
-    // 방법 2: RSS API
+    // 폴백: RSS API
     try {
-      const rssUrl = `${CONFIG.API.BOARD_RSS}?boardId=BBN&listCnt=20`;
+      const rssUrl = `${CONFIG.API.BOARD_RSS}?boardId=BBA&listCnt=20`;
       const result2 = await this.fetchApi(rssUrl, { method: 'GET' });
 
       if (typeof result2 === 'string') {
@@ -536,70 +618,131 @@ class GwApiClient {
 
   // ========== 예실 ==========
   async getBudget() {
-    log('Budget', 'API 호출 시작');
+    log('Budget', 'API 호출 시작 (3단계 방식)');
 
     const now = new Date();
     const year = now.getFullYear();
-    const month = now.getMonth() + 1;
+    const monthNum = now.getMonth() + 1;
 
-    // 분기 계산
+    // 분기 계산 (시작월, 종료월)
     let quarter, startMonth, endMonth;
-    if (month <= 3) {
+    if (monthNum <= 3) {
       quarter = 1; startMonth = '01'; endMonth = '03';
-    } else if (month <= 6) {
+    } else if (monthNum <= 6) {
       quarter = 2; startMonth = '04'; endMonth = '06';
-    } else if (month <= 9) {
+    } else if (monthNum <= 9) {
       quarter = 3; startMonth = '07'; endMonth = '09';
     } else {
       quarter = 4; startMonth = '10'; endMonth = '12';
     }
 
+    const startDate = `${year}${startMonth}`; // YYYYMM
+    const endDate = `${year}${endMonth}`;     // YYYYMM
+
     try {
-      const params = new URLSearchParams({
-        yyyy: year.toString(),
-        startMm: startMonth,
-        endMm: endMonth,
-        deptId: this.userInfo.deptId,
-        cmpId: this.userInfo.cmpId,
+      // 1단계: 메인 페이지 방문 (서버 세션 상태 설정)
+      // Playwright 캡처: 브라우저가 먼저 이 페이지를 로드함
+      const mainPageResponse = await fetch(`${CONFIG.BASE_URL}/ekp/view/budget/budgetMain`, {
+        method: 'GET',
+        headers: {
+          'Cookie': this.cookieString,
+          'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        },
       });
+      if (!mainPageResponse.ok) {
+        log('Budget', `1단계(메인페이지) 실패: ${mainPageResponse.status}`);
+      } else {
+        log('Budget', '1단계: budgetMain 페이지 방문 완료');
+      }
+
+      // 2단계: budgetAmtList 페이지 호출 (AJAX 초기화)
+      const initResponse = await fetch(`${CONFIG.BASE_URL}/ekp/inc/budget/budgetAmtList`, {
+        method: 'POST',
+        headers: {
+          'Cookie': this.cookieString,
+          'X-Requested-With': 'XMLHttpRequest',
+          'Naonajax': 'html',
+          'Referer': `${CONFIG.BASE_URL}/ekp/view/budget/budgetMain`,
+        },
+      });
+      if (!initResponse.ok) {
+        log('Budget', `2단계 실패: ${initResponse.status}`);
+      } else {
+        log('Budget', '2단계: budgetAmtList 세션 초기화 완료');
+      }
+
+      // 3단계: selectSysDate (시스템 날짜)
+      await this.fetchApi('/ekp/service/budget/selectSysDate', {
+        method: 'POST',
+        body: '',
+      });
+      log('Budget', '3단계: selectSysDate 완료');
+
+      // 4단계: __REQ_JSON_OBJECT__ 형식으로 예실 조회 (분기별)
+      // 브라우저 캡처: __REQ_JSON_OBJECT__=URL인코딩JSON 형식으로 전송
+      const requestBody = {
+        deptCd: this.userInfo.deptCd,
+        deptName: this.userInfo.deptName,
+        subDeptYn: '0',
+        startDate: startDate,
+        endDate: endDate,
+      };
+      log('Budget', `요청 파라미터: ${JSON.stringify(requestBody)}`);
+
+      // URLSearchParams로 올바른 form-encoding 사용
+      const params = new URLSearchParams();
+      params.append('__REQ_JSON_OBJECT__', JSON.stringify(requestBody));
 
       const result = await this.fetchApi(CONFIG.API.BUDGET, {
         method: 'POST',
         body: params.toString(),
+        referer: `${CONFIG.BASE_URL}/ekp/view/budget/budgetMain`,
       });
 
       log('Budget', '응답:', JSON.stringify(result).substring(0, 500));
 
-      const data = result.data || result;
-      const items = data.list || [];
+      // data가 배열로 바로 옴
+      const items = result.data || [];
 
-      // 합계 계산
-      let totalBudget = 0, totalSpent = 0, totalRemaining = 0;
+      // 콤마 제거하고 숫자로 변환하는 헬퍼
+      const parseAmt = (str) => parseInt((str || '0').replace(/,/g, ''), 10);
+
+      // 합계 행 찾기 (deptCd: "999999999")
+      const totalRow = items.find(item => item.deptCd === '999999999');
       const budgetItems = [];
 
+      // 개별 항목 (합계 제외)
       items.forEach(item => {
-        const budget = parseInt(item.budgetAmt || item.budget || 0);
-        const spent = parseInt(item.execAmt || item.spent || 0);
-        const remaining = parseInt(item.remainAmt || item.remaining || budget - spent);
+        if (item.deptCd === '999999999') return; // 합계 행 스킵
+        if (!item.accNm) return; // 계정명 없으면 스킵
 
-        totalBudget += budget;
-        totalSpent += spent;
-        totalRemaining += remaining;
-
-        if (item.acctNm || item.accountName) {
-          budgetItems.push({
-            account: item.acctNm || item.accountName,
-            budget: budget.toLocaleString('ko-KR'),
-            spent: spent.toLocaleString('ko-KR'),
-            remaining: remaining.toLocaleString('ko-KR'),
-          });
-        }
+        budgetItems.push({
+          account: item.accNm,
+          budget: item.bgtAmt || '0',
+          spent: item.slipAmt || '0',
+          remaining: item.remAmt || '0',
+        });
       });
+
+      // 합계 (totalRow가 있으면 사용, 없으면 직접 계산)
+      let totalBudget, totalSpent, totalRemaining;
+      if (totalRow) {
+        totalBudget = parseAmt(totalRow.bgtAmt);
+        totalSpent = parseAmt(totalRow.slipAmt);
+        totalRemaining = parseAmt(totalRow.remAmt);
+      } else {
+        totalBudget = budgetItems.reduce((sum, i) => sum + parseAmt(i.budget), 0);
+        totalSpent = budgetItems.reduce((sum, i) => sum + parseAmt(i.spent), 0);
+        totalRemaining = budgetItems.reduce((sum, i) => sum + parseAmt(i.remaining), 0);
+      }
+
+      log('Budget', `결과: 예산=${totalBudget}, 집행=${totalSpent}, 잔액=${totalRemaining}, 항목=${budgetItems.length}개`);
 
       return {
         year,
         quarter,
-        period: `${year}년 ${quarter}분기`,
+        month: monthNum,
+        period: `${year}년 ${quarter}분기 (${startMonth}~${endMonth}월)`,
         budget: totalBudget.toLocaleString('ko-KR'),
         spent: totalSpent.toLocaleString('ko-KR'),
         remaining: totalRemaining.toLocaleString('ko-KR'),

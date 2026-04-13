@@ -373,6 +373,13 @@ function quickPatternMatch(message) {
     }
   }
 
+  // v4.1: "예산/예실" 키워드 특별 처리 (team 패턴보다 우선)
+  // "우리팀 예실 현황" 같은 경우 team이 아닌 budget으로 분류
+  if (/예산|예실/i.test(trimmed)) {
+    console.log(`빠른 패턴 매칭: "${trimmed}" → budget (예산/예실 우선)`);
+    return { intent: 'budget', confidence: 0.95, fromPattern: true };
+  }
+
   for (const [intent, pattern] of Object.entries(QUICK_PATTERNS)) {
     if (pattern.test(trimmed)) {
       console.log(`빠른 패턴 매칭: "${trimmed}" → ${intent}`);
