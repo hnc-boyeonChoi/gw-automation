@@ -31,7 +31,7 @@ function publishToPubSub(message) {
 
   const payload = {
     messages: [{
-      data: Utilities.base64Encode(JSON.stringify(message)),
+      data: Utilities.base64Encode(JSON.stringify(message), Utilities.Charset.UTF_8),
     }],
   };
 
@@ -333,9 +333,18 @@ function callOpenAIWithHistory(userId, systemPrompt, userMessage) {
 // =====================
 // 빠른 패턴 매칭 (LLM 호출 전 - 비용 절감)
 // =====================
+// v4.1: Intent 우선순위 패턴 (방법 질문 vs 현황 조회 구분)
+const INTENT_MODIFIERS = {
+  howTo: /어떻게|방법|절차|가이드|하는\s*(법|방법)|신청\s*(방법|절차)/i,
+  statusCheck: /현황|조회|확인|남았|있어\??$|며칠|얼마/i,
+};
+
 const QUICK_PATTERNS = {
+  // v4.1: 온보딩 RAG (회사 업무 가이드) - "어떻게/방법" 질문은 RAG로
+  onboarding: /온보딩|신입|입사|구글\s*워크스페이스|okta|통합\s*로그인|총무|복리후생|채용|회계|자금|세무|카드|비용\s*정산|프로젝트\s*관리|erp|품질|it\s*자산|네트워크|vpn|방화벽|정보\s*보호|보안|서버|dns|파일\s*서버|복합기|소프트웨어|pc\s*신청|장비|(연차|휴가).*(어떻게|방법|절차|신청\s*방법|사용법|경조|환갑|결혼|출산)|경조사|스포츠\s*센터|헬스|체육|동호회|법인\s*카드|출장|교육|연수/i,
+  // 그룹웨어 스크래핑 (현황 조회)
   team: /팀\s*(현황|상황)?|근태|출근|누가\s*(출근|휴가|외근)|우리\s*팀/i,
-  leave: /연차|휴가|남은\s*(연차|휴가)|내\s*연차/i,
+  leave: /연차\s*(며칠|얼마|몇\s*일|남았?|잔여|현황|있어)|남은\s*(연차|휴가)|내\s*연차/i,
   approval: /결재|승인|미결/i,
   board: /게시판|공지|새\s*글/i,
   mail: /메일|이메일/i,
@@ -351,6 +360,18 @@ const QUICK_PATTERNS = {
 
 function quickPatternMatch(message) {
   const trimmed = message.trim();
+
+  // v4.1: "연차" 키워드 특별 처리 (방법 질문 vs 현황 조회 구분)
+  if (/연차|휴가/i.test(trimmed)) {
+    if (INTENT_MODIFIERS.howTo.test(trimmed)) {
+      console.log(`빠른 패턴 매칭: "${trimmed}" → onboarding (방법 질문)`);
+      return { intent: 'onboarding', confidence: 0.95, fromPattern: true };
+    }
+    if (INTENT_MODIFIERS.statusCheck.test(trimmed)) {
+      console.log(`빠른 패턴 매칭: "${trimmed}" → leave (현황 조회)`);
+      return { intent: 'leave', confidence: 0.95, fromPattern: true };
+    }
+  }
 
   for (const [intent, pattern] of Object.entries(QUICK_PATTERNS)) {
     if (pattern.test(trimmed)) {
@@ -371,48 +392,40 @@ function classifyIntent(userId, userMessage) {
     return quickResult;
   }
 
-  // 2. 패턴 매칭 실패 시 LLM 호출
-  const systemPrompt = `당신은 그룹웨어 챗봇의 의도 분류기입니다.
-사용자 메시지를 분석하여 아래 intent 중 하나를 JSON으로 반환하세요.
+  // 2. 패턴 매칭 실패 시 LLM 호출 (v4.1 개선)
+  const systemPrompt = `그룹웨어 챗봇 의도 분류기. JSON으로 응답.
 
-**핵심 규칙:**
-1. 그룹웨어/업무와 관련 없는 일반 대화 → 반드시 unknown
-2. 메시지에 구체적인 업무 주제(팀, 연차, 결재, 게시판 등)가 있으면 → 해당 intent
-3. "다시 알려줘"가 있어도 업무 주제가 명확하면 → 해당 intent
-4. repeat은 오직 "다시", "아까 그거"처럼 주제가 전혀 없을 때만
-
-**unknown으로 분류해야 하는 경우:**
-- 날씨, 시간, 개인적인 이야기 ("비가 와", "배고파", "오늘 뭐해?")
-- 그룹웨어와 무관한 질문 ("맛집 추천해줘", "게임 뭐해?")
-- 업무 키워드가 전혀 없는 잡담
+**핵심 분류 기준:**
+1. 현황/조회/확인 질문 → 그룹웨어 조회 (team, leave, approval 등)
+2. 어떻게/방법/절차 질문 → onboarding (온보딩 가이드)
+3. 업무 무관 → unknown
 
 **예시:**
-- "팀 현황 다시 알려줘" → team
-- "연차 다시 보여줘" → leave
-- "다시 보여줘" → repeat
-- "그리고 연차는?" → leave
-- "오늘 비가 오잖아" → unknown (업무 무관)
-- "점심 뭐 먹지?" → unknown (업무 무관)
-- "안녕" → greeting
+- "팀 누가 출근했어?" → team
+- "연차 며칠 남았어?" → leave
+- "연차 신청 어떻게 해?" → onboarding
+- "VPN 연결 방법" → onboarding
+- "결재할 거 있어?" → approval
+- "오늘 날씨 어때?" → unknown
 
-**가능한 intent:**
-- team: 팀 현황, 팀원 근태, 누가 출근/휴가/건강검진
-- leave: 내 연차, 남은 휴가, 연차 잔여
-- approval: 결재, 전자결재, 승인할 문서
-- board: 게시판, 공지사항, 새 글
+**Intent 목록:**
+- team: 팀 현황, 근태
+- leave: 연차 현황, 남은 휴가
+- approval: 결재 문서
+- board: 게시판, 공지
+- mail: 메일
 - note: 쪽지
-- mail: 메일, 이메일
-- budget: 예산, 예실, 비용
-- all: 전체 브리핑, 오늘 현황, 모든 정보
-- login: 로그인, 접속
-- greeting: 인사 (안녕, 하이)
-- help: 도움말, 뭐 할 수 있어
-- repeat: 주제 없이 "다시", "아까 그거"만 있을 때
-- clear: 대화 기록 초기화 (잊어, 초기화, 리셋)
-- unknown: 업무와 무관한 대화, 위에 해당하지 않는 경우
+- budget: 예산, 예실
+- all: 전체 브리핑
+- login: 로그인
+- onboarding: 업무 가이드 (방법, 절차, VPN, IT자산, 복리후생 등)
+- greeting: 인사
+- help: 도움말
+- repeat: 주제 없이 "다시"만
+- clear: 초기화
+- unknown: 업무 무관
 
-반드시 JSON 형식으로만 응답하세요:
-{"intent": "unknown", "confidence": 0.95}`;
+반드시 JSON: {"intent": "...", "confidence": 0.95}`;
 
   const response = callOpenAIWithHistory(userId, systemPrompt, userMessage);
 
@@ -525,6 +538,10 @@ function handleNaturalLanguage(event, userMessage) {
     case 'login':
       return triggerLoginByIntent(userId, spaceId);
 
+    case 'onboarding':
+      // v4.0: 온보딩 RAG 질의
+      return triggerRagByIntent(userId, spaceId, userMessage);
+
     case 'unknown':
     default:
       // 친절한 안내 메시지 + 메뉴 카드
@@ -636,6 +653,33 @@ function triggerLoginByIntent(userId, spaceId) {
 
     return reply('🔄 로그인 진행 중이에요!\n📱 Okta Verify 앱에서 푸시 승인해주세요.');
   } catch (e) {
+    return reply('오류가 발생했어요: ' + e.message);
+  }
+}
+
+// v4.1: 온보딩 RAG 질의 (대화 히스토리 포함)
+function triggerRagByIntent(userId, spaceId, question) {
+  try {
+    // 대화 히스토리 가져오기 (최근 4개)
+    const history = getConversationHistory(userId);
+    const recentHistory = history.slice(-4).map(h => ({
+      role: h.role,
+      content: h.content
+    }));
+
+    publishToPubSub({
+      action: 'rag',
+      question: question,
+      conversationHistory: recentHistory,  // v4.1: 히스토리 추가
+      userId: userId,
+      spaceId: spaceId,
+      timestamp: new Date().toISOString(),
+    });
+
+    console.log('자연어 → Pub/Sub 발행 완료 (rag):', question, '히스토리:', recentHistory.length);
+    return reply('🔍 온보딩 문서를 검색 중이에요...');
+  } catch (e) {
+    console.error('triggerRagByIntent 에러:', e.message);
     return reply('오류가 발생했어요: ' + e.message);
   }
 }

@@ -7,6 +7,11 @@ service-account.json
 
 # Auto-generated
 cookies.json
+userinfo.json
+skills-lock.json
+
+# Claude
+.claude/
 
 # Logs
 *.log

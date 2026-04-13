@@ -6,6 +6,43 @@ const path = require('path');
 const fs = require('fs');
 const { GwApiClient } = require('./api-client');
 
+// ========== v4.1: RAG API (대화 히스토리 지원) ==========
+const RAG_API_URL = 'http://172.19.0.129:8501';
+
+async function askRag(question, conversationHistory = []) {
+  try {
+    log('RAG', `질문: ${question}, 히스토리: ${conversationHistory.length}개`);
+
+    // v4.1: 원본 질문만 전송 (히스토리는 별도 필드로)
+    // 히스토리를 질문에 합치면 RAG 검색이 혼란스러워짐
+    const response = await fetch(`${RAG_API_URL}/ask`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question: question,  // 원본 질문만
+        conversation_history: conversationHistory  // 별도 전달 (RAG API에서 필요시 활용)
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`RAG API 응답 에러: ${response.status}`);
+    }
+
+    const data = await response.json();
+    log('RAG', `답변 수신 완료, 출처: ${data.sources?.length || 0}개`);
+    return {
+      answer: data.answer,
+      sources: data.sources || []
+    };
+  } catch (error) {
+    log('RAG', `에러: ${error.message}`);
+    return {
+      answer: `❌ RAG 서버 연결 실패: ${error.message}`,
+      sources: []
+    };
+  }
+}
+
 // ========== 설정 ==========
 const CONFIG = {
   // GCP
@@ -79,6 +116,65 @@ async function sendChatMessage(spaceId, text) {
     log('Chat', '메시지 전송 완료');
   } catch (err) {
     log('Chat', '메시지 전송 실패:', err.message);
+  }
+}
+
+// v4.1: 카드 형식 메시지 전송 (RAG 응답용, UI 개선)
+async function sendChatCard(spaceId, title, answer, sources) {
+  try {
+    const chat = await getChatClient();
+
+    // 출처 버튼 생성 (URL이 있는 것만, 최대 5개)
+    const sourceButtons = sources
+      .filter(s => s.url)
+      .slice(0, 5)
+      .map(s => ({
+        text: (s.title || '문서 보기').substring(0, 25),
+        onClick: {
+          openLink: { url: s.url }
+        }
+      }));
+
+    const card = {
+      cardsV2: [{
+        cardId: 'ragCard',
+        card: {
+          header: {
+            title: title,
+            subtitle: `v4.1 온보딩 가이드 · 출처 ${sources.length}개`
+          },
+          sections: [
+            {
+              widgets: [{
+                textParagraph: { text: answer }
+              }]
+            }
+          ]
+        }
+      }]
+    };
+
+    // 출처 버튼이 있으면 섹션 추가
+    if (sourceButtons.length > 0) {
+      card.cardsV2[0].card.sections.push({
+        header: '📎 참고 문서',
+        collapsible: true,
+        uncollapsibleWidgetsCount: 1,
+        widgets: [{
+          buttonList: { buttons: sourceButtons }
+        }]
+      });
+    }
+
+    await chat.spaces.messages.create({
+      parent: spaceId,
+      requestBody: card,
+    });
+    log('Chat', '카드 메시지 전송 완료');
+  } catch (err) {
+    log('Chat', '카드 전송 실패:', err.message);
+    // 실패시 텍스트로 전송
+    await sendChatMessage(spaceId, `📚 *${title}*\n\n${answer}`);
   }
 }
 
@@ -1328,6 +1424,33 @@ async function handleMessage(message) {
         await mbLoginResult.browser.close();
         log('Worker', '브라우저 종료');
       }
+      break;
+
+    case 'rag':
+      // v4.1.2: 온보딩 RAG 질의 (가이드 링크 자동 변환)
+      log('Worker', 'RAG 질의 처리');
+      const ragResult = await askRag(data.question, data.conversationHistory || []);
+
+      // 답변에서 '가이드' 참조를 클릭 가능한 링크로 변환
+      let processedAnswer = ragResult.answer;
+      if (ragResult.sources && ragResult.sources.length > 0) {
+        const firstSource = ragResult.sources[0];
+        if (firstSource.url) {
+          // 패턴: 'XXX 가이드'를 참조/참고 → 클릭 가능한 링크로
+          // 예: 'SSL-VPN 사용자 가이드'를 참조 → <a href="...">가이드 링크</a>를 참조
+          processedAnswer = processedAnswer.replace(
+            /'[^']+\s*가이드'를?\s*(참조|참고)/g,
+            `<a href="${firstSource.url}">가이드 링크</a>를 참고`
+          );
+          // {{가이드 링크}} 플레이스홀더도 처리
+          processedAnswer = processedAnswer.replace(
+            /\{\{가이드 링크\}\}/g,
+            `<a href="${firstSource.url}">가이드 링크</a>`
+          );
+        }
+      }
+
+      await sendChatCard(data.spaceId, '📚 온보딩 가이드', processedAnswer, ragResult.sources);
       break;
 
     default:
