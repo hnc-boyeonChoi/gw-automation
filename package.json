@@ -1,12 +1,29 @@
 {
   "name": "gw-automation",
-  "version": "2.0.0",
+  "version": "4.3.1",
   "description": "한컴 그룹웨어 자동화 - Pub/Sub 기반",
   "main": "worker.js",
   "scripts": {
     "start": "node worker.js",
+    "test": "jest --coverage",
+    "test:watch": "jest --watch",
     "test:pubsub": "node test-pubsub.js",
     "test:publish": "node test-publish.js"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "coverageThreshold": {
+      "global": {
+        "branches": 80,
+        "functions": 85,
+        "lines": 87,
+        "statements": 87
+      }
+    },
+    "collectCoverageFrom": [
+      "org-search.js",
+      "!node_modules/**"
+    ]
   },
   "keywords": [],
   "author": "",
@@ -16,5 +33,8 @@
     "dotenv": "^17.4.0",
     "googleapis": "^171.4.0",
     "playwright": "^1.59.1"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0"
   }
 }

@@ -5,6 +5,16 @@ const { google } = require('googleapis');
 const path = require('path');
 const fs = require('fs');
 const { GwApiClient } = require('./api-client');
+const {
+  extractSearchTerm,
+  extractDutySearchTerm,
+  detectSearchType,
+  parseNameQuery,
+  parseOrgQuery,
+  parseStatus,
+  formatOrgSearchResult,
+  QUERY_PATTERNS,
+} = require('./org-search');
 
 // ========== v4.1: RAG API (대화 히스토리 지원) ==========
 const RAG_API_URL = 'http://172.19.0.129:8501';
@@ -95,6 +105,10 @@ function log(tag, ...args) {
   const timestamp = new Date().toLocaleString('ko-KR');
   console.log(`[${timestamp}] [${tag}]`, ...args);
 }
+
+// ========== 조직도 검색 유틸 ==========
+// v4.3: org-search.js 모듈로 분리됨 (테스트 가능)
+// 함수들은 상단에서 require('./org-search')로 import
 
 // ========== Google Chat ==========
 async function getChatClient() {
@@ -1467,6 +1481,122 @@ async function handleMessage(message) {
       }
 
       await sendChatCard(data.spaceId, '📚 온보딩 가이드', processedAnswer, ragResult.sources);
+      break;
+
+    case 'org_search':
+      // v4.2.3: 조직도 검색 (자동 로그인 지원)
+      log('Worker', `조직도 검색: "${data.query}"`);
+      if (data.params) {
+        log('Worker', `LLM params: ${JSON.stringify(data.params)}`);
+      }
+
+      // v4.2.5: 조직도 검색 실행 함수 (재시도용) - role도 반환
+      const doOrgSearch = async (client) => {
+        let employees;
+        let extractedRole = '';
+
+        // v4.2.1: 팀명 감지 함수
+        const isTeamName = (str) => /[팀실부]$|본부$|센터$/.test(str || '');
+
+        // v4.2.5: LLM이 파싱한 params가 있으면 바로 사용
+        // name이 있으면 이름 검색 우선 (Yes/No 질문: "김학수님은 팀장이야?")
+        if (data.params) {
+          const { name, teamHint, product, role } = data.params;
+          extractedRole = role || '';
+
+          if (name) {
+            // 이름이 있으면 이름 검색 우선 (팀 힌트로 product 활용)
+            log('Worker', `LLM 파싱 사용 (name): name="${name}", teamHint="${teamHint || product}", role="${role}"`);
+            employees = await client.searchEmployee(name, 'name', { teamHint: teamHint || product });
+
+            // v4.2.5: role이 없으면 쿼리에서 직접 추출 ("김학수님은 팀장이야?")
+            if (!extractedRole) {
+              const { role: parsedRole } = parseOrgQuery(data.query);
+              if (parsedRole) {
+                extractedRole = parsedRole;
+                log('Worker', `쿼리에서 role 추출: "${parsedRole}"`);
+              }
+            }
+          } else if (product && role && isTeamName(product)) {
+            // 팀명 + 역할 검색 (예: "제품기술팀 팀장 누구야?")
+            log('Worker', `LLM 파싱 사용 (team): teamName="${product}", role="${role}"`);
+            employees = await client.searchEmployee(null, 'team', { teamName: product, role });
+          } else if (product || role) {
+            // 제품/역할 검색 (duty)
+            log('Worker', `LLM 파싱 사용 (duty): product="${product}", role="${role}"`);
+            employees = await client.searchEmployee(null, 'duty', { product, role });
+          }
+        }
+
+        // params 없거나 파싱 실패 시 기존 로직
+        if (!employees) {
+          const searchType = detectSearchType(data.query);
+          log('Worker', `패턴 파싱 (searchType: ${searchType})`);
+
+          if (searchType === 'duty') {
+            const { product, role, roles } = parseOrgQuery(data.query);
+            extractedRole = role || '';
+            // v4.2.1: 팀명 + 역할 검색 분기
+            if (product && role && isTeamName(product)) {
+              log('Worker', `패턴 파싱 (team): teamName="${product}", role="${role}"`);
+              employees = await client.searchEmployee(null, 'team', { teamName: product, role });
+            } else {
+              // v4.2.6: 복수 역할 전달
+              employees = await client.searchEmployee(null, 'duty', { product, role, roles });
+            }
+          } else {
+            const { name, teamHint } = parseNameQuery(data.query);
+            employees = await client.searchEmployee(name, 'name', { teamHint });
+
+            // v4.2.5: Yes/No 질문에서 역할 추출 ("김학수님은 팀장이야?")
+            const { role: parsedRole } = parseOrgQuery(data.query);
+            if (parsedRole) extractedRole = parsedRole;
+          }
+        }
+
+        return { employees, role: extractedRole };
+      };
+
+      try {
+        const orgClient = new GwApiClient();
+        await orgClient.init();
+
+        const { employees, role } = await doOrgSearch(orgClient);
+        const responseMsg = formatOrgSearchResult(employees, data.query, { role });
+        await sendChatMessage(data.spaceId, responseMsg);
+      } catch (orgErr) {
+        log('Worker', `조직도 검색 에러: ${orgErr.message}`);
+
+        // v4.2.3: 세션 만료 시 자동 로그인 후 재시도
+        if (orgErr.message.includes('세션 만료') || orgErr.message.includes('다시 로그인') || orgErr.code === 'SESSION_EXPIRED') {
+          log('Worker', '세션 만료 감지 - 자동 로그인 시도');
+          await sendChatMessage(data.spaceId, '🔄 세션 만료됨. 자동 로그인 중...');
+
+          try {
+            // 로그인 실행
+            const loginResult = await doLogin(data, { returnBrowser: false });
+
+            if (loginResult.success) {
+              log('Worker', '자동 로그인 성공 - 조직도 검색 재시도');
+
+              // 새 클라이언트로 재시도
+              const newClient = new GwApiClient();
+              await newClient.init();
+
+              const { employees, role } = await doOrgSearch(newClient);
+              const responseMsg = formatOrgSearchResult(employees, data.query, { role });
+              await sendChatMessage(data.spaceId, responseMsg);
+            } else {
+              await sendChatMessage(data.spaceId, '❌ 자동 로그인 실패. 수동으로 /login 해주세요.');
+            }
+          } catch (retryErr) {
+            log('Worker', `재시도 에러: ${retryErr.message}`);
+            await sendChatMessage(data.spaceId, `❌ 재시도 실패: ${retryErr.message}`);
+          }
+        } else {
+          await sendChatMessage(data.spaceId, `❌ 조직도 검색 실패: ${orgErr.message}`);
+        }
+      }
       break;
 
     default:

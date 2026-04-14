@@ -1,5 +1,8 @@
 /**
  * GW Automation - Google Chat Bot (Pub/Sub 버전)
+ * v4.0 - 조직도 검색 추가
+ * v4.1 - 조직도 검색 Intent 분류 개선
+ * v4.2 - 조직도 검색 패턴 확장 (어느팀, 담당업무, 뭐해 등)
  */
 
 // =====================
@@ -343,15 +346,19 @@ const QUICK_PATTERNS = {
   // v4.1: 온보딩 RAG (회사 업무 가이드) - "어떻게/방법" 질문은 RAG로
   onboarding: /온보딩|신입|입사|구글\s*워크스페이스|okta|통합\s*로그인|총무|복리후생|채용|회계|자금|세무|카드|비용\s*정산|프로젝트\s*관리|erp|품질|it\s*자산|네트워크|vpn|방화벽|정보\s*보호|보안|서버|dns|파일\s*서버|복합기|소프트웨어|pc\s*신청|장비|(연차|휴가).*(어떻게|방법|절차|신청\s*방법|사용법|경조|환갑|결혼|출산)|경조사|스포츠\s*센터|헬스|체육|동호회|법인\s*카드|출장|교육|연수/i,
   // 그룹웨어 스크래핑 (현황 조회)
-  team: /팀\s*(현황|상황)?|근태|출근|누가\s*(출근|휴가|외근)|우리\s*팀/i,
+  // v4.0 fix: "검증팀 김학수" 같은 조직도 검색과 구분하기 위해 더 구체적 패턴 사용
+  team: /팀\s*(현황|상황)|근태|누가\s*(출근|휴가|외근)|우리\s*팀|^출근$/i,
   leave: /연차\s*(며칠|얼마|몇\s*일|남았?|잔여|현황|있어)|남은\s*(연차|휴가)|내\s*연차/i,
   approval: /결재|승인|미결/i,
   board: /게시판|공지|새\s*글/i,
-  mail: /메일|이메일/i,
+  // v4.3: mail 패턴을 "내 메일함 조회"에 한정 (타인 메일주소는 orgSearch)
+  mail: /^메일$|^이메일$|메일\s*(확인|왔|있|읽|안\s*읽)|내\s*메일|받은\s*메일/i,
   note: /쪽지/i,
   budget: /예산|예실|비용/i,
   all: /전체\s*브리핑|모든\s*정보|오늘\s*현황|다\s*알려/i,
   login: /로그인|접속/i,
+  // v4.2: 조직도 검색 (핵심 패턴만, 나머지는 LLM 분류)
+  orgSearch: /누구야|누구에요|내선|번호|전화|연락처|조직도/i,
   greeting: /^(안녕|하이|헬로|ㅎㅇ|hi|hello)/i,
   help: /도움말|뭐\s*할\s*수\s*있|어떤\s*기능/i,
   clear: /잊어|초기화|리셋|대화\s*삭제/i,
@@ -361,7 +368,27 @@ const QUICK_PATTERNS = {
 function quickPatternMatch(message) {
   const trimmed = message.trim();
 
-  // v4.1: "연차" 키워드 특별 처리 (방법 질문 vs 현황 조회 구분)
+  // ========================================
+  // v4.3: 사람 이름 감지 → orgSearch (최우선)
+  // ========================================
+  // 한글 2-4자 이름 + "님" 또는 정보 요청 키워드
+  const hasPersonName = /[가-힣]{2,4}(님|씨)?/.test(trimmed);
+  // v4.3.1: 상태 질문 키워드 추가 (출근/퇴근/근무/상태)
+  const isPersonInfoRequest = /메일|이메일|번호|내선|전화|연락처|뭐야|뭐에요|알려|찾아|검색|누구|어느\s*팀|어디\s*팀|담당|출근|퇴근|근무|상태|재택|휴가|연차|외근/.test(trimmed);
+  const isNotMyInfo = !/^(내|나의|제)\s/.test(trimmed);  // "내 메일"은 제외
+
+  if (hasPersonName && isPersonInfoRequest && isNotMyInfo) {
+    // 추가 검증: 팀 현황 질문이 아닌지 확인
+    const isTeamStatusQuery = /팀\s*(현황|상황)|근태|누가\s*(출근|휴가|외근)|우리\s*팀/.test(trimmed);
+    if (!isTeamStatusQuery) {
+      console.log(`빠른 패턴 매칭: "${trimmed}" → orgSearch (사람 이름 + 정보 요청)`);
+      return { intent: 'orgSearch', confidence: 0.95, fromPattern: true };
+    }
+  }
+
+  // ========================================
+  // v4.1: 연차/휴가 - 방법 vs 현황 구분
+  // ========================================
   if (/연차|휴가/i.test(trimmed)) {
     if (INTENT_MODIFIERS.howTo.test(trimmed)) {
       console.log(`빠른 패턴 매칭: "${trimmed}" → onboarding (방법 질문)`);
@@ -373,13 +400,17 @@ function quickPatternMatch(message) {
     }
   }
 
-  // v4.1: "예산/예실" 키워드 특별 처리 (team 패턴보다 우선)
-  // "우리팀 예실 현황" 같은 경우 team이 아닌 budget으로 분류
+  // ========================================
+  // v4.1: 예산/예실 우선 처리
+  // ========================================
   if (/예산|예실/i.test(trimmed)) {
     console.log(`빠른 패턴 매칭: "${trimmed}" → budget (예산/예실 우선)`);
     return { intent: 'budget', confidence: 0.95, fromPattern: true };
   }
 
+  // ========================================
+  // v4.3: 명확한 패턴만 빠른 매칭, 애매한 건 LLM에게
+  // ========================================
   for (const [intent, pattern] of Object.entries(QUICK_PATTERNS)) {
     if (pattern.test(trimmed)) {
       console.log(`빠른 패턴 매칭: "${trimmed}" → ${intent}`);
@@ -399,40 +430,54 @@ function classifyIntent(userId, userMessage) {
     return quickResult;
   }
 
-  // 2. 패턴 매칭 실패 시 LLM 호출 (v4.1 개선)
-  const systemPrompt = `그룹웨어 챗봇 의도 분류기. JSON으로 응답.
+  // 2. 패턴 매칭 실패 시 LLM 호출 (v4.3 - 범용 의도 분류)
+  const systemPrompt = `그룹웨어 챗봇 의도 분류. JSON으로만 응답.
 
-**핵심 분류 기준:**
-1. 현황/조회/확인 질문 → 그룹웨어 조회 (team, leave, approval 등)
-2. 어떻게/방법/절차 질문 → onboarding (온보딩 가이드)
-3. 업무 무관 → unknown
+## 핵심 구분 기준 (우선순위 순)
 
-**예시:**
-- "팀 누가 출근했어?" → team
-- "연차 며칠 남았어?" → leave
+### 1. 타인 정보 검색 → orgSearch
+특정 사람의 정보(연락처, 메일, 소속, 담당업무 등)를 묻는 질문
+- "명상태님 메일 뭐야?" → orgSearch (타인 메일주소)
+- "김철수 전화번호" → orgSearch
+- "개발팀 PO 누구야?" → orgSearch
+
+### 2. 내 정보 조회 → 해당 스크래핑
+"내/나의" + 정보 조회, 또는 암묵적으로 본인 정보 조회
+- "메일 왔어?" → mail (내 메일함)
+- "연차 며칠?" → leave (내 연차)
+- "결재할 거 있어?" → approval (내 결재함)
+
+### 3. 방법/절차 질문 → onboarding
+"어떻게", "방법", "절차" 등 업무 가이드 질문
 - "연차 신청 어떻게 해?" → onboarding
-- "VPN 연결 방법" → onboarding
-- "결재할 거 있어?" → approval
-- "오늘 날씨 어때?" → unknown
 
-**Intent 목록:**
-- team: 팀 현황, 근태
-- leave: 연차 현황, 남은 휴가
-- approval: 결재 문서
-- board: 게시판, 공지
-- mail: 메일
-- note: 쪽지
-- budget: 예산, 예실
-- all: 전체 브리핑
-- login: 로그인
-- onboarding: 업무 가이드 (방법, 절차, VPN, IT자산, 복리후생 등)
-- greeting: 인사
-- help: 도움말
-- repeat: 주제 없이 "다시"만
-- clear: 초기화
-- unknown: 업무 무관
+## Intent 목록
+| Intent | 설명 | 예시 |
+|--------|------|------|
+| orgSearch | 타인 정보 검색 | 메일주소, 연락처, 소속, 담당 |
+| team | 팀 근태 현황 | 누가 출근/휴가 |
+| leave | 내 연차 | 연차 며칠 남았어 |
+| approval | 내 결재 | 결재할 거 |
+| board | 게시판 | 공지사항 |
+| mail | 내 메일함 | 메일 왔어? |
+| note | 쪽지 | 쪽지 확인 |
+| budget | 예산 | 예실 현황 |
+| all | 전체 브리핑 | 오늘 현황 |
+| onboarding | 업무 가이드 | ~어떻게 해? |
+| greeting | 인사 | 안녕 |
+| help | 도움말 | 뭐 할 수 있어? |
+| unknown | 업무 무관 | - |
 
-반드시 JSON: {"intent": "...", "confidence": 0.95}`;
+## orgSearch params (해당시 포함)
+- name: 사람 이름 (한글 2-4자)
+- teamHint: 팀/부서 힌트
+- product: 제품/서비스명
+- role: 직책/역할 (PO, PM, TL, PoC 등)
+
+## 출력 형식
+{"intent":"...", "params":{...}, "confidence":0.95}
+
+JSON 1개만. 설명 X. 배열 X.`;
 
   const response = callOpenAIWithHistory(userId, systemPrompt, userMessage);
 
@@ -442,7 +487,14 @@ function classifyIntent(userId, userMessage) {
 
   try {
     // JSON 파싱 시도
-    const parsed = JSON.parse(response);
+    let parsed = JSON.parse(response);
+
+    // v4.2: 배열이면 마지막 항목 사용 (LLM이 히스토리 전체 분류한 경우)
+    if (Array.isArray(parsed)) {
+      console.log('LLM이 배열 반환, 마지막 항목 사용');
+      parsed = parsed[parsed.length - 1];
+    }
+
     return parsed;
   } catch (e) {
     // JSON 파싱 실패 시 텍스트에서 intent 추출 시도
@@ -548,6 +600,10 @@ function handleNaturalLanguage(event, userMessage) {
     case 'onboarding':
       // v4.0: 온보딩 RAG 질의
       return triggerRagByIntent(userId, spaceId, userMessage);
+
+    case 'orgSearch':
+      // v4.2: 조직도 검색 (LLM params 전달)
+      return triggerOrgSearchByIntent(userId, spaceId, userMessage, result.params);
 
     case 'unknown':
     default:
@@ -687,6 +743,34 @@ function triggerRagByIntent(userId, spaceId, question) {
     return reply('🔍 온보딩 문서를 검색 중이에요...');
   } catch (e) {
     console.error('triggerRagByIntent 에러:', e.message);
+    return reply('오류가 발생했어요: ' + e.message);
+  }
+}
+
+// v4.0: 조직도 검색
+// v4.2: params 지원 (LLM 리라이팅 결과)
+function triggerOrgSearchByIntent(userId, spaceId, query, params = null) {
+  try {
+    const message = {
+      action: 'org_search',
+      query: query,
+      userId: userId,
+      spaceId: spaceId,
+      timestamp: new Date().toISOString(),
+    };
+
+    // LLM이 파싱한 params가 있으면 추가
+    if (params) {
+      message.params = params;
+      console.log('org_search with LLM params:', JSON.stringify(params));
+    }
+
+    publishToPubSub(message);
+
+    console.log('자연어 → Pub/Sub 발행 완료 (org_search):', query);
+    return reply('🔍 조직도를 검색 중이에요...');
+  } catch (e) {
+    console.error('triggerOrgSearchByIntent 에러:', e.message);
     return reply('오류가 발생했어요: ' + e.message);
   }
 }

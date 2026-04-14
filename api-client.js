@@ -140,8 +140,20 @@ class GwApiClient {
 
     // JSON 파싱 시도
     try {
-      return JSON.parse(text);
+      const json = JSON.parse(text);
+
+      // v4.2.3: 세션 만료 감지 (NO_AJAX_LOGIN)
+      if (json.result === 'NO_AJAX_LOGIN') {
+        log('API', '세션 만료 감지: NO_AJAX_LOGIN');
+        const err = new Error('세션 만료 - 다시 로그인해주세요');
+        err.code = 'SESSION_EXPIRED';
+        throw err;
+      }
+
+      return json;
     } catch (e) {
+      // 이미 세션 만료 에러면 그대로 던짐
+      if (e.code === 'SESSION_EXPIRED') throw e;
       return text; // XML이나 HTML인 경우 텍스트 반환
     }
   }
@@ -319,6 +331,228 @@ class GwApiClient {
     });
 
     return { totalMembers: empList.length, attendance };
+  }
+
+  // ========== 조직도 검색 ==========
+  // searchType: 'name' (이름 검색) | 'duty' (담당업무 검색)
+  // options: { product, role } - duty 검색 시 사용
+  async searchEmployee(searchTerm, searchType = 'name', options = {}) {
+    log('OrgSearch', `타입: ${searchType}, 검색어: "${searchTerm}", 옵션: ${JSON.stringify(options)}`);
+
+    const params = new URLSearchParams({
+      orderMode: 'RANK_USERNAME',
+      listType: 'list',
+      'paging.pageNo': '1',
+      'paging.listBlock': '100',
+      deptId: this.userInfo.deptId,
+      cmpId: this.userInfo.cmpId,
+      subDeptYn: 'N',
+      serviceType: 'org',
+      afflMode: 'cmpall',  // 전사 검색
+      userType: '',
+      searchType: '',
+    });
+
+    if (searchType === 'name') {
+      // 이름 검색: API 검색 기능 사용 (전사 검색)
+      params.delete('deptId');  // 전사 검색을 위해 deptId 제거
+      params.set('searchWord', searchTerm);
+      params.set('typeSearch', 'NAME');
+    } else if (searchType === 'team') {
+      // v4.2.2: 팀명 검색 - 담당업무에서 팀명으로 검색 후 필터링
+      // DEPTNAME은 SQL 에러 발생하므로 CHRGWORK로 검색
+      params.delete('deptId');
+      params.set('paging.listBlock', '200');
+      const teamName = options.teamName || '';
+      if (teamName) {
+        // v4.2.4: 팀명에서 공백 제거 + "팀" 제거하고 검색
+        // (예: "오피스 솔루션 개발팀" → "오피스솔루션개발")
+        const searchTerm = teamName.replace(/\s+/g, '').replace(/[팀실부]$/, '');
+        params.set('searchWord', searchTerm);
+        params.set('typeSearch', 'CHRGWORK');  // 담당업무로 검색
+      }
+    } else {
+      // 담당업무 검색: API의 담당업무 검색 기능 활용
+      params.delete('deptId');
+      params.set('paging.listBlock', '100');
+      // 제품명으로 담당업무 검색 (API 기능 활용)
+      const product = options.product || '';
+      if (product) {
+        params.set('searchWord', product);
+        params.set('typeSearch', 'CHRGWORK');  // 담당업무 검색
+      }
+    }
+
+    const result = await this.fetchApi(CONFIG.API.EMP_LIST, {
+      method: 'POST',
+      body: params.toString(),
+    });
+    const empList = result.data?.empList || result.empList || result.list || [];
+    log('OrgSearch', `API 결과: ${empList.length}명`);
+
+    // 결과 정규화
+    let employees = empList.map(emp => ({
+      name: emp.personBean?.userName || '',
+      deptName: emp.deptBean?.deptName || '',
+      deptLoc: emp.deptBean?.deptLocName || '',
+      position: emp.posBean?.posName || '',
+      office: emp.ofcBean?.ofcName || '',
+      duty: emp.empBean?.chrgWork || '',
+      phone: emp.empBean?.cmpPhone || emp.empBean?.lxtnNo || '',
+      mobile: emp.personBean?.cellPhone || '',
+      email: emp.empBean?.cmpEmail || '',
+      empId: emp.empId || '',
+      status: emp.empAtnStatus || '',
+    }));
+
+    // v4.2.6: 양방향 추론 필터링 (복수 역할 지원)
+    if (searchType === 'duty') {
+      const { product, role, roles = [] } = options;
+      // roles 배열이 없으면 role을 배열로 변환
+      const allRoles = roles.length > 0 ? roles : (role ? [role] : []);
+
+      if (product && allRoles.length > 0) {
+        // 제품+역할 양방향 추론
+        const productLower = product.toLowerCase();
+
+        log('OrgSearch', `양방향 추론: product="${product}", roles=${JSON.stringify(allRoles)}`);
+
+        // 디버그: 제품명 포함된 직원 먼저 확인
+        const productMatches = employees.filter(emp => {
+          const dutyLower = (emp.duty || '').toLowerCase();
+          const teamLower = (emp.deptName || '').toLowerCase();
+          return dutyLower.includes(productLower) || teamLower.includes(productLower);
+        });
+        log('OrgSearch', `[DEBUG] 제품(${product}) 포함 직원: ${productMatches.length}명`);
+        if (productMatches.length > 0 && productMatches.length <= 5) {
+          productMatches.forEach(emp => {
+            log('OrgSearch', `[DEBUG] - ${emp.name} | ${emp.deptName} | ${emp.duty?.substring(0, 50)}...`);
+          });
+        }
+
+        // v4.2.1: 직책 필드 역할 (팀장, 파트장, 실장 등)
+        const officialPositions = ['팀장', '파트장', '실장', '센터장', '본부장', '그룹장'];
+
+        employees = employees.filter(emp => {
+          const duty = emp.duty || '';
+          const team = emp.deptName || '';
+          const office = emp.office || '';  // 직책 (팀장, 파트장 등)
+          const dutyLower = duty.toLowerCase();
+          const teamLower = team.toLowerCase();
+
+          // v4.2.6: 복수 역할 중 ANY 매칭
+          let hasRole = false;
+          let hasRoleInDuty = false;
+          let hasRoleInOffice = false;
+
+          for (const r of allRoles) {
+            // v4.2.6: 한글/영문 혼합 텍스트에서 역할 매칭
+            // 방법1: 공백/특수문자로 분리 후 정확 매칭
+            const dutyTokens = duty.split(/[\s,./()（）\[\]·]+/).map(t => t.toUpperCase());
+            const officeTokens = office.split(/[\s,./()（）\[\]·]+/).map(t => t.toUpperCase());
+            const roleUpper = r.toUpperCase();
+
+            const isOfficialPosition = officialPositions.some(pos => r.includes(pos));
+
+            // 토큰 정확 매칭 또는 토큰 내 포함 (예: "PM/PO" → ["PM", "PO"])
+            const matchInDuty = dutyTokens.some(t => t === roleUpper || t.includes(roleUpper));
+            const matchInOffice = officeTokens.some(t => t === roleUpper || t.includes(roleUpper));
+
+            if (matchInDuty) hasRoleInDuty = true;
+            if (isOfficialPosition ? office.includes(r) : matchInOffice) hasRoleInOffice = true;
+          }
+          hasRole = hasRoleInDuty || hasRoleInOffice;
+
+          // 제품 매칭: 담당업무 OR 팀명에서 찾기
+          const hasProductInDuty = dutyLower.includes(productLower);
+          const hasProductInTeam = teamLower.includes(productLower);
+          const hasProduct = hasProductInDuty || hasProductInTeam;
+
+          // Case A: 담당업무에 제품+역할 둘 다 있음
+          const caseA = hasProductInDuty && hasRoleInDuty;
+
+          // Case B: 역할 있고 (duty or office), 팀명에 제품
+          const caseB = hasRole && hasProductInTeam;
+
+          // Case C: 담당업무에 제품, 역할 있음 (duty or office or team)
+          const caseC = hasProductInDuty && hasRole;
+
+          // Case D: 팀명에 제품+역할 (예: "어시스턴트팀 팀장")
+          const caseD = hasProductInTeam && hasRoleInOffice;
+
+          return caseA || caseB || caseC || caseD;
+        });
+
+        log('OrgSearch', `양방향 추론 필터링 후: ${employees.length}명`);
+
+        // v4.2.7: 결과 0이면 힌트 정보 추가 (폴백 검색 제거)
+        if (employees.length === 0 && allRoles.length > 0) {
+          log('OrgSearch', `"${product}" + "${allRoles.join('/')}" 조합 결과 없음`);
+        }
+      } else if (product) {
+        // 제품만 있는 경우 (역할 없이)
+        const productLower = product.toLowerCase();
+        employees = employees.filter(emp => {
+          const dutyLower = (emp.duty || '').toLowerCase();
+          const teamLower = (emp.deptName || '').toLowerCase();
+          return dutyLower.includes(productLower) || teamLower.includes(productLower);
+        });
+        log('OrgSearch', `제품 필터링 후: ${employees.length}명`);
+      }
+    }
+
+    // v4.2.2: 팀명 검색 시 팀명 + 직책 필터링
+    if (searchType === 'team') {
+      const teamName = options.teamName || '';
+      const role = options.role || '';
+
+      // 1단계: 팀명 필터링 (담당업무 검색 결과에서 팀명 매칭)
+      // v4.2.4: 공백 제거하고 비교 (예: "오피스 솔루션 개발팀" == "오피스솔루션개발팀")
+      if (teamName) {
+        const beforeCount = employees.length;
+        const normalizedTeamName = teamName.replace(/\s+/g, '').replace(/[팀실부]$/, '');
+        employees = employees.filter(emp => {
+          const deptName = emp.deptName || '';
+          const normalizedDeptName = deptName.replace(/\s+/g, '').replace(/[팀실부]$/, '');
+          return normalizedDeptName.includes(normalizedTeamName) || normalizedTeamName.includes(normalizedDeptName);
+        });
+        log('OrgSearch', `팀명(${teamName}) 필터링: ${beforeCount}명 → ${employees.length}명`);
+      }
+
+      // 2단계: 직책 필터링
+      if (role) {
+        const officialPositions = ['팀장', '파트장', '실장', '센터장', '본부장', '그룹장'];
+        const isOfficialPosition = officialPositions.some(pos => role.includes(pos));
+        const roleRegex = new RegExp(`\\b${role}\\b`, 'i');
+
+        const beforeCount = employees.length;
+        employees = employees.filter(emp => {
+          const office = emp.office || '';
+          const duty = emp.duty || '';
+
+          // 직책 필드에서 역할 찾기 (팀장, 파트장 등)
+          if (isOfficialPosition && office.includes(role)) return true;
+
+          // 담당업무에서 역할 찾기 (PO, PM 등)
+          if (roleRegex.test(duty) || roleRegex.test(office)) return true;
+
+          return false;
+        });
+        log('OrgSearch', `직책(${role}) 필터링: ${beforeCount}명 → ${employees.length}명`);
+      }
+    }
+
+    // v4.2: 이름 검색 시 팀 힌트로 필터링
+    if (searchType === 'name' && options.teamHint) {
+      const teamHint = options.teamHint;
+      const beforeCount = employees.length;
+      employees = employees.filter(emp =>
+        emp.deptName && emp.deptName.includes(teamHint)
+      );
+      log('OrgSearch', `팀 힌트(${teamHint}) 필터링: ${beforeCount}명 → ${employees.length}명`);
+    }
+
+    return employees;
   }
 
   // ========== 연차 ==========
