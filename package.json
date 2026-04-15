@@ -1,6 +1,6 @@
 {
   "name": "gw-automation",
-  "version": "4.3.1",
+  "version": "4.3.2",
   "description": "한컴 그룹웨어 자동화 - Pub/Sub 기반",
   "main": "worker.js",
   "scripts": {
@@ -14,14 +14,15 @@
     "testEnvironment": "node",
     "coverageThreshold": {
       "global": {
-        "branches": 80,
-        "functions": 85,
-        "lines": 87,
-        "statements": 87
+        "branches": 90,
+        "functions": 97,
+        "lines": 97,
+        "statements": 97
       }
     },
     "collectCoverageFrom": [
       "org-search.js",
+      "rag-client.js",
       "!node_modules/**"
     ]
   },
